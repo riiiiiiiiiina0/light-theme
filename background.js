@@ -6,188 +6,362 @@
 import { getUrls, addUrl, deleteUrl } from './storage.js';
 
 /**
- * Apply light theme to the current tab and set badge
- * @param {number} tabId - The ID of the tab to apply light theme to
+ * Decide whether to inject inversion CSS and which icon to show,
+ * based on system theme, page theme and whether URL is in stored list.
  */
-function applyLightTheme(tabId) {
-  if (!tabId) return;
-  chrome.scripting.executeScript({
-    target: { tabId },
-    files: ['content-add-style.js'],
-  });
-  // Swap the extension action icon to the light version for this tab
-  chrome.action.setIcon({ path: 'icons/icon-light-48x48.png', tabId });
-  // Clear any previous badge text, if present
-  chrome.action.setBadgeText({ text: '', tabId });
+function decideInjectionAndIcon(systemTheme, pageTheme, isInStoredList) {
+  // Normalize
+  const sys = systemTheme === 'dark' ? 'dark' : 'light';
+  const page = pageTheme === 'dark' ? 'dark' : 'light';
+
+  // Truth table implementation
+  if (sys === 'light') {
+    if (page === 'light') {
+      return { shouldInject: false, icon: 'icons/icon-light-48x48.png' };
+    }
+    // page is dark
+    if (isInStoredList) {
+      return { shouldInject: true, icon: 'icons/icon-light-48x48.png' };
+    }
+    return { shouldInject: false, icon: 'icons/icon-dark-48x48.png' };
+  }
+
+  // sys === 'dark'
+  if (page === 'dark') {
+    return { shouldInject: false, icon: 'icons/icon-dark-48x48.png' };
+  }
+  // page is light
+  if (isInStoredList) {
+    return { shouldInject: true, icon: 'icons/icon-dark-48x48.png' };
+  }
+  return { shouldInject: false, icon: 'icons/icon-light-48x48.png' };
 }
 
 /**
- * Remove light theme from the current tab and clear badge
- * @param {number} tabId - The ID of the tab to remove light theme from
+ * Detect current page theme (light/dark) and system theme for a tab.
+ * New approach: capture a JPEG thumbnail of the active tab and analyze pixels.
+ * Falls back to computed-style detection when capture is unavailable.
  */
-function removeLightTheme(tabId) {
-  if (!tabId) return;
-  chrome.scripting.executeScript({
-    target: { tabId },
-    files: ['content-remove-style.js'],
-  });
-  // Revert the extension action icon back to the default dark version
-  chrome.action.setIcon({ path: 'icons/icon-dark-48x48.png', tabId });
-  chrome.action.setBadgeText({ text: '', tabId });
+async function detectThemesInTab(tabId) {
+  try {
+    // Always attempt to read system theme and a fallback page theme from within the page
+    const [inPage] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        // Runs in page context
+        const prefersDark =
+          typeof window.matchMedia === 'function' &&
+          window.matchMedia('(prefers-color-scheme: dark)').matches;
+
+        function parseRgbStringToRgb(colorStr) {
+          if (!colorStr) return { r: 255, g: 255, b: 255, a: 1 };
+          const match = colorStr
+            .replace(/\s+/g, '')
+            .match(/^rgba?\((\d+),(\d+),(\d+)(?:,(\d*\.?\d+))?\)$/i);
+          if (!match) {
+            if (colorStr.toLowerCase() === 'transparent') {
+              return { r: 255, g: 255, b: 255, a: 0 };
+            }
+            const temp = document.createElement('div');
+            temp.style.color = colorStr;
+            document.body.appendChild(temp);
+            const cs = getComputedStyle(temp).color;
+            temp.remove();
+            return parseRgbStringToRgb(cs);
+          }
+          return {
+            r: Number(match[1]),
+            g: Number(match[2]),
+            b: Number(match[3]),
+            a: match[4] !== undefined ? Number(match[4]) : 1,
+          };
+        }
+
+        function srgbToLinear(channel) {
+          const c = channel / 255;
+          return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+        }
+
+        function relativeLuminance(rgb) {
+          const r = srgbToLinear(rgb.r);
+          const g = srgbToLinear(rgb.g);
+          const b = srgbToLinear(rgb.b);
+          return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        }
+
+        function getEffectiveBackgroundColor(element) {
+          let el = element;
+          while (el) {
+            const bg = getComputedStyle(el).backgroundColor;
+            const rgba = parseRgbStringToRgb(bg);
+            if (rgba.a !== 0 && bg.toLowerCase() !== 'transparent') {
+              return rgba;
+            }
+            el = el.parentElement;
+          }
+          const docBg = getComputedStyle(
+            document.documentElement,
+          ).backgroundColor;
+          const parsedDocBg = parseRgbStringToRgb(docBg);
+          if (parsedDocBg.a !== 0 && docBg.toLowerCase() !== 'transparent') {
+            return parsedDocBg;
+          }
+          return { r: 255, g: 255, b: 255, a: 1 };
+        }
+
+        const root = document.body || document.documentElement;
+        const bgRgb = getEffectiveBackgroundColor(root);
+        const textColorStr = getComputedStyle(root).color;
+        const textRgb = parseRgbStringToRgb(textColorStr);
+        const bgLum = relativeLuminance(bgRgb);
+        const textLum = relativeLuminance(textRgb);
+        const fallbackPageTheme = bgLum < textLum ? 'dark' : 'light';
+
+        return {
+          systemTheme: prefersDark ? 'dark' : 'light',
+          fallbackPageTheme,
+        };
+      },
+    });
+
+    const systemTheme = inPage?.result?.systemTheme || 'light';
+    let pageThemeFromScreenshot = null;
+
+    // Attempt screenshot-based detection only if the tab is active in its window
+    let tabInfo = null;
+    try {
+      tabInfo = await chrome.tabs.get(tabId);
+    } catch (_) {
+      tabInfo = null;
+    }
+
+    if (
+      tabInfo?.active &&
+      typeof chrome.tabs.captureVisibleTab === 'function' &&
+      typeof OffscreenCanvas === 'function' &&
+      typeof createImageBitmap === 'function'
+    ) {
+      try {
+        const dataUrl = await chrome.tabs.captureVisibleTab(tabInfo.windowId, {
+          format: 'jpeg',
+          quality: 70,
+        });
+        if (dataUrl) {
+          const response = await fetch(dataUrl);
+          const blob = await response.blob();
+          const bitmap = await createImageBitmap(blob);
+
+          // Scale down to a small thumbnail while preserving aspect ratio
+          const longestSide = Math.max(bitmap.width, bitmap.height);
+          const targetLongest = 96; // thumbnail target
+          const scale =
+            longestSide > targetLongest ? targetLongest / longestSide : 1;
+          const thumbWidth = Math.max(1, Math.round(bitmap.width * scale));
+          const thumbHeight = Math.max(1, Math.round(bitmap.height * scale));
+
+          const canvas = new OffscreenCanvas(thumbWidth, thumbHeight);
+          const ctx = canvas.getContext('2d', { willReadFrequently: true });
+          if (!ctx) {
+            bitmap.close?.();
+            throw new Error('2D context not available');
+          }
+          ctx.drawImage(bitmap, 0, 0, thumbWidth, thumbHeight);
+          bitmap.close?.();
+
+          const imageData = ctx.getImageData(0, 0, thumbWidth, thumbHeight);
+          const data = imageData.data;
+
+          // Compute average relative luminance over all pixels
+          let luminanceSum = 0;
+          const pixelCount = data.length / 4;
+          const srgbToLinear = (c8) => {
+            const c = c8 / 255;
+            return c <= 0.04045
+              ? c / 12.92
+              : Math.pow((c + 0.055) / 1.055, 2.4);
+          };
+          for (let i = 0; i < data.length; i += 4) {
+            const r = srgbToLinear(data[i]);
+            const g = srgbToLinear(data[i + 1]);
+            const b = srgbToLinear(data[i + 2]);
+            const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            luminanceSum += lum;
+          }
+          const avgLum = luminanceSum / pixelCount;
+          pageThemeFromScreenshot = avgLum < 0.5 ? 'dark' : 'light';
+        }
+      } catch (_) {
+        // Ignore capture errors and fall back
+      }
+    }
+
+    const pageTheme =
+      pageThemeFromScreenshot ?? inPage?.result?.fallbackPageTheme ?? 'light';
+    return { systemTheme, pageTheme };
+  } catch (error) {
+    console.warn('Theme detection failed for tab', tabId, error);
+    return null;
+  }
 }
 
 /**
- * Updates the action badge based on whether the URL is in the light theme list.
- * @param {string} url - The URL of the tab.
- * @param {number} tabId - The ID of the tab.
+ * Determine whether a URL is covered by the stored list (prefix match).
  */
-async function updateBadgeForTab(url, tabId) {
-  if (!url || !tabId) {
-    chrome.action.setIcon({ path: 'icons/icon-dark-48x48.png', tabId });
-    chrome.action.setBadgeText({ text: '', tabId });
+function urlIsInStoredList(url, storedUrls) {
+  if (!url) return false;
+  try {
+    return storedUrls.some((u) => url.startsWith(u));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Inject the inversion CSS content script.
+ */
+async function applyFlip(tabId) {
+  if (!tabId) return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['content-add-style.js'],
+    });
+  } catch (error) {
+    console.warn('Failed to apply flip on tab', tabId, error);
+  }
+}
+
+/**
+ * Remove the inversion CSS content script effects.
+ */
+async function removeFlip(tabId) {
+  if (!tabId) return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['content-remove-style.js'],
+    });
+  } catch (error) {
+    console.warn('Failed to remove flip on tab', tabId, error);
+  }
+}
+
+/**
+ * Set the action icon for a tab.
+ */
+function setIcon(tabId, iconPath) {
+  if (!tabId) return;
+  chrome.action.setIcon({ path: iconPath, tabId });
+}
+
+/**
+ * Evaluate a tab: detect themes, check stored list, decide injection and icon, and apply.
+ */
+async function evaluateTab(tabId, url) {
+  if (!tabId || !url) {
+    setIcon(tabId, 'icons/icon-dark-48x48.png');
     return;
   }
-  try {
-    const urls = await getUrls();
-    const shouldApplyLightTheme = urls.some((u) => url.startsWith(u));
 
-    if (shouldApplyLightTheme) {
-      chrome.action.setIcon({ path: 'icons/icon-light-48x48.png', tabId });
-    } else {
-      chrome.action.setIcon({ path: 'icons/icon-dark-48x48.png', tabId });
-      chrome.action.setBadgeText({ text: '', tabId });
+  try {
+    const [storedUrls, detection] = await Promise.all([
+      getUrls(),
+      detectThemesInTab(tabId),
+    ]);
+
+    if (!detection) {
+      // If detection failed, fall back to icon by stored list and do not inject
+      const inList = urlIsInStoredList(url, storedUrls);
+      setIcon(
+        tabId,
+        inList ? 'icons/icon-light-48x48.png' : 'icons/icon-dark-48x48.png',
+      );
+      return;
     }
+
+    const isInList = urlIsInStoredList(url, storedUrls);
+    const { shouldInject, icon } = decideInjectionAndIcon(
+      detection.systemTheme,
+      detection.pageTheme,
+      isInList,
+    );
+
+    if (shouldInject) {
+      await applyFlip(tabId);
+    } else {
+      await removeFlip(tabId);
+    }
+
+    setIcon(tabId, icon);
   } catch (error) {
-    console.error('Error updating icon for tab:', error);
-    chrome.action.setIcon({ path: 'icons/icon-dark-48x48.png', tabId });
-    chrome.action.setBadgeText({ text: '', tabId }); // Clear badge on error
+    console.error('Error evaluating tab', tabId, error);
+    setIcon(tabId, 'icons/icon-dark-48x48.png');
   }
 }
 
 // Listen for tab updates
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-  // Process when a URL has loaded or is loading, or title changes (good proxy for SPA nav)
   if (
-    tab.url &&
+    tab?.url &&
     (changeInfo.status === 'loading' || changeInfo.status === 'complete')
   ) {
-    await updateBadgeForTab(tab.url, tabId); // Update badge based on current state
-
-    // Revised logic for applying/removing theme
-    try {
-      const urls = await getUrls();
-      const shouldApplyLightTheme = urls.some((url) => {
-        return tab.url && tab.url.startsWith(url);
-      });
-
-      if (shouldApplyLightTheme) {
-        applyLightTheme(tabId); // This will also set the badge
-      } else {
-        // If the tab's URL does not start with any stored URL, remove the theme.
-        removeLightTheme(tabId); // This will also clear the badge
-      }
-    } catch (error) {
-      console.error('Error in onUpdated listener:', error);
-    }
+    await evaluateTab(tabId, tab.url);
   }
 });
 
 // Listen for history state updates (e.g., SPA navigations)
 chrome.webNavigation.onHistoryStateUpdated.addListener(async (details) => {
   if (details.frameId === 0 && details.url) {
-    // frameId === 0 means top-level frame
-    await updateBadgeForTab(details.url, details.tabId); // Update badge
-
-    // Revised logic for applying/removing theme
-    try {
-      const urls = await getUrls();
-      const shouldApplyLightTheme = urls.some((url) => {
-        return details.url && details.url.startsWith(url);
-      });
-
-      if (shouldApplyLightTheme) {
-        applyLightTheme(details.tabId); // This also sets the badge
-      } else {
-        // If the new URL in SPA navigation does not start with any stored URL, remove the theme.
-        removeLightTheme(details.tabId); // This also clears the badge
-      }
-    } catch (error) {
-      console.error('Error in onHistoryStateUpdated listener:', error);
-    }
+    await evaluateTab(details.tabId, details.url);
   }
 });
 
-// Listen for extension action button clicks
+// Listen for extension action button clicks (toggle stored list membership for origin)
 chrome.action.onClicked.addListener(async (tab) => {
-  if (!tab.id || !tab.url) return; // Ensure tab.id is present
-
+  if (!tab?.id || !tab?.url) return;
   try {
-    const url = new URL(tab.url);
-    const origin = url.origin;
+    const origin = new URL(tab.url).origin;
     const urls = await getUrls();
-    const originExists = urls.some((existingUrl) => existingUrl === origin);
+    const exists = urls.some((u) => u === origin);
 
-    if (originExists) {
+    if (exists) {
       await deleteUrl(origin);
-      removeLightTheme(tab.id); // Clears badge
     } else {
       await addUrl(origin);
-      applyLightTheme(tab.id); // Sets badge
     }
+
+    // Re-evaluate after update
+    await evaluateTab(tab.id, tab.url);
   } catch (error) {
     console.error('Error toggling URL:', error);
-    // Attempt to set a neutral badge state for the current tab on error
-    if (tab.id) {
-      chrome.action.setBadgeText({ text: '', tabId: tab.id });
-    }
   }
 });
 
 // Listen for when the active tab changes
-chrome.tabs.onActivated.addListener(async (activeInfo) => {
-  try {
-    const tab = await chrome.tabs.get(activeInfo.tabId);
-    if (tab.url) {
-      await updateBadgeForTab(tab.url, activeInfo.tabId);
-    } else {
-      // If tab has no URL (e.g., new tab page before navigation), clear badge
-      chrome.action.setBadgeText({ text: '', tabId: activeInfo.tabId });
-    }
-  } catch (error) {
-    // Errors can happen if tab is closed quickly, etc.
-    console.warn('Error in onActivated listener:', error);
-    chrome.action.setBadgeText({ text: '', tabId: activeInfo.tabId }); // Clear badge on error
-  }
-});
+// chrome.tabs.onActivated.addListener(async (activeInfo) => {
+//   try {
+//     const tab = await chrome.tabs.get(activeInfo.tabId);
+//     if (tab?.url) {
+//       await evaluateTab(activeInfo.tabId, tab.url);
+//     }
+//   } catch (error) {
+//     console.warn('Error in onActivated listener:', error);
+//   }
+// });
 
-// Initial badge setup for already open tabs when the extension starts
-// (e.g., after installation or enabling)
-async function initializeBadges() {
+// Initialize icons for already open tabs when the extension starts
+async function initializeTabs() {
   try {
     const tabs = await chrome.tabs.query({});
-    const urls = await getUrls();
     for (const tab of tabs) {
       if (tab.id && tab.url) {
-        const shouldApplyLightTheme = urls.some((u) => tab.url?.startsWith(u));
-        if (shouldApplyLightTheme) {
-          chrome.action.setIcon({
-            path: 'icons/icon-light-48x48.png',
-            tabId: tab.id,
-          });
-        } else {
-          chrome.action.setIcon({
-            path: 'icons/icon-dark-48x48.png',
-            tabId: tab.id,
-          });
-        }
-        // Ensure no badge text is displayed
-        chrome.action.setBadgeText({ text: '', tabId: tab.id });
+        await evaluateTab(tab.id, tab.url);
       }
     }
   } catch (error) {
-    console.error('Error initializing badges:', error);
+    console.error('Error initializing tabs:', error);
   }
 }
 
 // Run initialization
-initializeBadges();
+initializeTabs();
